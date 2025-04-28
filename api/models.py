@@ -142,8 +142,8 @@ class UserImage(models.Model):
         return f"Image for {self.user.name}"
 
 class Like(models.Model):
-    from_user = models.ForeignKey(User, related_name='likes_given', on_delete=models.CASCADE)
-    to_user = models.ForeignKey(User, related_name='likes_received', on_delete=models.CASCADE)
+    from_user = models.ForeignKey(User, to_field="telegram_id", related_name='likes_given', on_delete=models.CASCADE)
+    to_user = models.ForeignKey(User, to_field="telegram_id", related_name='likes_received', on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
     is_skip = models.BooleanField(default=False)
 
@@ -225,5 +225,5 @@ class Match(models.Model):
 
 class Referral(models.Model):
     referrer = models.ForeignKey(User, related_name='referrals', on_delete=models.CASCADE)
-    referred_user = models.OneToOneField(User, related_name='referred_by', on_delete=models.CASCADE)
+    referred_user = models.IntegerField()
     created_at = models.DateTimeField(auto_now_add=True)

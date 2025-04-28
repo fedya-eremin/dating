@@ -11,16 +11,18 @@ from .serializers import (
     MatchSerializer,
     ReferralSerializer
 )
-import shortuuid
-from .events import event_producer
 from django.db.models import Q
 from rest_framework import serializers
 from rest_framework.generics import CreateAPIView
 import logging
 from rest_framework.views import APIView
-import asyncio
+import redis
+import json
+import os
 
 logger = logging.getLogger(__name__)
+
+REDIS_URL = os.getenv('REDIS_URL', 'redis://redis:6379/0')
 
 class UserImageViewSet(viewsets.ModelViewSet):
     queryset = UserImage.objects.all()
@@ -41,31 +43,10 @@ class UserImageViewSet(viewsets.ModelViewSet):
         
         try:
             user = User.objects.get(telegram_id=telegram_id)
-        except User.DoesNotExist:
+        except Exception:
             raise serializers.ValidationError({"telegram_id": "Пользователь не найден"})
-        
-        # Проверяем наличие файла
-        image = self.request.FILES.get('image')
-        if not image:
-            raise serializers.ValidationError({"image": "Файл изображения обязателен"})
-        
-        # Проверяем тип файла
-        if not image.content_type.startswith('image/'):
-            raise serializers.ValidationError({"image": "Файл должен быть изображением"})
-        
         try:
-            # Сохраняем изображение
             instance = serializer.save(user=user)
-            
-            # Проверяем, что файл действительно сохранился
-            if not instance.image:
-                raise serializers.ValidationError({"image": "Ошибка сохранения изображения"})
-            
-            # Проверяем доступность файла
-            if not instance.image.storage.exists(instance.image.name):
-                raise serializers.ValidationError({"image": "Ошибка сохранения в хранилище"})
-            
-            # Пересчитываем рейтинг пользователя
             user.calculate_primary_rating()
             
             logger.info(f"Successfully uploaded image for user {telegram_id}: {instance.image.url}")
@@ -94,7 +75,7 @@ class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
     serializer_class = UserSerializer
     lookup_field = 'telegram_id'
-    permission_classes = [AllowAny]  # Разрешаем доступ без аутентификации
+    permission_classes = [AllowAny]
 
     def get_queryset(self):
         queryset = User.objects.all()
@@ -102,42 +83,49 @@ class UserViewSet(viewsets.ModelViewSet):
             # Фильтрация для поиска подходящих партнеров
             exclude_user = self.request.query_params.get('exclude_user')
             if exclude_user:
-                # Исключаем текущего пользователя
-                queryset = queryset.exclude(telegram_id=exclude_user)
+                exclude_user = User.objects.get(telegram_id=exclude_user)
+                queryset = queryset.exclude(id=exclude_user.id)
                 
-                # Получаем предпочтения текущего пользователя
-                current_user = User.objects.filter(telegram_id=exclude_user).first()
-                if current_user:
-                    # Фильтруем по предпочтениям пола
-                    queryset = queryset.filter(
-                        gender=current_user.seeking_gender,
-                        seeking_gender=current_user.gender
-                    )
-                    
-                    # Исключаем пользователей, с которыми уже есть лайки
-                    liked_users = Like.objects.filter(
-                        from_user__telegram_id=exclude_user
-                    ).values_list('to_user__telegram_id', flat=True)
-                    queryset = queryset.exclude(telegram_id__in=liked_users)
-                    
-                    # Исключаем пользователей, с которыми уже есть мэтчи
-                    matched_users = Match.objects.filter(
-                        Q(user1__telegram_id=exclude_user) | Q(user2__telegram_id=exclude_user),
-                        is_active=True
-                    ).values_list('user1__telegram_id', 'user2__telegram_id')
-                    matched_ids = set()
-                    for user1, user2 in matched_users:
-                        matched_ids.add(user1)
-                        matched_ids.add(user2)
-                    queryset = queryset.exclude(telegram_id__in=matched_ids)
-                    
-                    # Сортируем по рейтингу
-                    queryset = queryset.order_by('-combined_rating')
-                    
-                    # Ограничиваем количество результатов
-                    limit = int(self.request.query_params.get('limit', 20))
-                    queryset = queryset[:limit]
-                    
+                # Фильтруем по предпочтениям пола
+                queryset = queryset.filter(
+                    gender=exclude_user.seeking_gender,
+                    seeking_gender=exclude_user.gender
+                )
+                
+                # Исключаем пользователей, с которыми уже есть лайки
+                liked_users = Like.objects.filter(
+                    from_user__telegram_id=exclude_user.telegram_id
+                ).values_list('to_user__telegram_id', flat=True)
+                queryset = queryset.exclude(telegram_id__in=liked_users)
+                
+                # Исключаем пользователей, с которыми уже есть мэтчи
+                matched_users = Match.objects.filter(
+                    Q(user1__telegram_id=exclude_user.telegram_id) | Q(user2__telegram_id=exclude_user.telegram_id),
+                    is_active=True
+                ).values_list('user1__telegram_id', 'user2__telegram_id')
+                matched_ids = set()
+                for user1, user2 in matched_users:
+                    matched_ids.add(user1)
+                    matched_ids.add(user2)
+                queryset = queryset.exclude(telegram_id__in=matched_ids)
+                
+                # Сортируем по рейтингу
+                queryset = queryset.order_by('-combined_rating')
+                
+                # Ограничиваем количество результатов
+                limit = int(self.request.query_params.get('limit', 20))
+                queryset = queryset[:limit]
+
+                try:
+                    redis_client = redis.from_url(REDIS_URL)
+                    profiles_data = [UserSerializer(profile).data for profile in queryset]
+                    queue_key = f"profile_queue:{exclude_user.telegram_id}"
+                    # Добавляем новые профили
+                    if profiles_data:
+                        redis_client.rpush(queue_key, *[json.dumps(profile) for profile in profiles_data])
+                        logger.info(f"Added {len(profiles_data)} profiles to queue for user {exclude_user.telegram_id}")
+                except Exception as e:
+                    logger.error(f"Error adding profiles to Redis queue: {str(e)}")
         return queryset
 
     @action(detail=True, methods=['post'])
@@ -196,43 +184,13 @@ class UserViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-    def perform_create(self, serializer):
-        instance = serializer.save()
-        # Отправляем событие создания профиля
-        try:
-            event_producer.send_event(
-                'user_events',
-                'profile_created',
-                {
-                    'user_id': instance.telegram_id,
-                    'profile_data': self.get_serializer(instance).data
-                }
-            )
-        except Exception as e:
-            logger.error(f"Error sending event: {str(e)}")
-
-    def perform_update(self, serializer):
-        instance = serializer.save()
-        # Отправляем событие обновления профиля
-        try:
-            event_producer.send_event(
-                'user_events',
-                'profile_updated',
-                {
-                    'user_id': instance.telegram_id,
-                    'profile_data': self.get_serializer(instance).data
-                }
-            )
-        except Exception as e:
-            logger.error(f"Error sending event: {str(e)}")
-
 class LikeViewSet(viewsets.ModelViewSet):
     queryset = Like.objects.all()
     serializer_class = LikeSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def perform_create(self, serializer):
-        like = serializer.save(from_user=self.request.user)
+        like = serializer.save()
         if not like.is_skip:
             # Проверяем на взаимный лайк
             mutual_like = Like.objects.filter(
@@ -241,7 +199,6 @@ class LikeViewSet(viewsets.ModelViewSet):
                 is_skip=False
             ).exists()
             if mutual_like:
-                # Создаем мэтч
                 Match.objects.create(
                     user1=like.from_user,
                     user2=like.to_user
@@ -250,33 +207,52 @@ class LikeViewSet(viewsets.ModelViewSet):
 class ReferralViewSet(viewsets.ModelViewSet):
     queryset = Referral.objects.all()
     serializer_class = ReferralSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
-    def get_queryset(self):
-        return Referral.objects.filter(referrer=self.request.user)
-
-    @action(detail=True, methods=['POST'])
-    def use_referral(self, request, pk=None):
-        referrer = self.get_object()
-        referred_user = User.objects.get(telegram_id=request.data['telegram_id'])
-        
-        referral, created = Referral.objects.get_or_create(
-            referrer=referrer,
-            referred_user=referred_user
-        )
-        
-        return Response({'status': 'referral applied'}, status=status.HTTP_201_CREATED)
 
 class MatchViewSet(viewsets.ModelViewSet):
     queryset = Match.objects.all()
     serializer_class = MatchSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
-    def get_queryset(self):
-        return Match.objects.filter(
-            Q(user1=self.request.user) | Q(user2=self.request.user),
-            is_active=True
-        )
+    @action(detail=False, methods=['get'])
+    def check(self, request):
+        """Проверяет, есть ли мэтч между двумя пользователями"""
+        user1_id = request.query_params.get('user1')
+        user2_id = request.query_params.get('user2')
+        
+        if not user1_id or not user2_id:
+            return Response(
+                {'error': 'Требуются оба параметра: user1 и user2'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        try:
+            user1 = User.objects.get(telegram_id=user1_id)
+            user2 = User.objects.get(telegram_id=user2_id)
+            
+            # Проверяем наличие взаимных лайков
+            user1_liked = Like.objects.filter(
+                from_user=user1,
+                to_user=user2,
+                is_skip=False
+            ).exists()
+            
+            user2_liked = Like.objects.filter(
+                from_user=user2,
+                to_user=user1,
+                is_skip=False
+            ).exists()
+            
+            is_match = user1_liked and user2_liked
+            
+            return Response({'is_match': is_match})
+            
+        except Exception:
+            return Response(
+                {'error': 'Один из пользователей не найден'},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
     @action(detail=True, methods=['post'])
     def mark_conversation_initiated(self, request, pk=None):
@@ -289,37 +265,39 @@ class MatchViewSet(viewsets.ModelViewSet):
             status=status.HTTP_403_FORBIDDEN
         )
 
-    def perform_create(self, serializer):
-        instance = serializer.save()
-        event_producer.send_event(
-            'matches',
-            'new_match',
-            {
-                'user1_id': instance.user1.telegram_id,
-                'user2_id': instance.user2.telegram_id,
-                'timestamp': instance.created_at.isoformat()
-            }
-        )
-
 class MatchCreateView(CreateAPIView):
     serializer_class = MatchSerializer
     permission_classes = [IsAuthenticated]
 
     def perform_create(self, serializer):
-        user1 = self.request.user
-        user2 = serializer.validated_data['user2']
+        # Get telegram IDs from query params
+        user1_tg_id = self.request.query_params.get('user1')
+        user2_tg_id = self.request.query_params.get('user2')
         
-        # Проверяем, не существует ли уже матч между этими пользователями
+        # Validate required parameters
+        if not user1_tg_id or not user2_tg_id:
+            raise serializers.ValidationError("Требуются оба параметра: user1 и user2")
+            
+        try:
+            # Get actual User objects by telegram_id
+            user1 = User.objects.get(telegram_id=user1_tg_id)
+            user2 = User.objects.get(telegram_id=user2_tg_id)
+        except User.DoesNotExist:
+            raise serializers.ValidationError("Один из пользователей не найден")
+
+        # Check for existing active match using User instances
         if Match.objects.filter(
             (Q(user1=user1, user2=user2) | Q(user1=user2, user2=user1)),
             is_active=True
         ).exists():
             raise serializers.ValidationError("Матч между этими пользователями уже существует")
         
-        serializer.save(user1=user1)
+        # Create new match with both User instances
+        serializer.save(user1=user1, user2=user2)
 
 class UserImageView(APIView):
-    permission_classes = [AllowAny]  # Разрешаем доступ без аутентификации для бота
+    permission_classes = [AllowAny]
+    parser_classes = [MultiPartParser]
     
     def post(self, request):
         try:
@@ -330,7 +308,6 @@ class UserImageView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-            # Находим пользователя по telegram_id
             try:
                 user = User.objects.get(telegram_id=telegram_id)
             except User.DoesNotExist:
@@ -339,7 +316,6 @@ class UserImageView(APIView):
                     status=status.HTTP_404_NOT_FOUND
                 )
             
-            # Проверяем, что файл изображения был отправлен
             if 'image' not in request.FILES:
                 return Response(
                     {"error": "No image file provided"},
@@ -347,23 +323,35 @@ class UserImageView(APIView):
                 )
             
             # Создаем изображение
-            image = UserImage.objects.create(
-                user=user,
-                image=request.FILES['image']
-            )
+            serializer = UserImageSerializer(data={
+                'user': user.id,
+                'image': request.FILES['image']
+            })
             
-            # Если это первое фото - делаем его главным
-            if not UserImage.objects.filter(user=user, is_main=True).exists():
-                image.is_main = True
-                image.save()
-            
-            return Response(
-                UserImageSerializer(image).data,
-                status=status.HTTP_201_CREATED
-            )
+            if serializer.is_valid():
+                image = serializer.save()
+                
+                # Если это первое изображение пользователя, делаем его главным
+                if not UserImage.objects.filter(user=user, is_main=True).exists():
+                    image.is_main = True
+                    image.save()
+                
+                # Обновляем рейтинг пользователя
+                user.calculate_primary_rating()
+                
+                return Response(
+                    UserImageSerializer(image).data,
+                    status=status.HTTP_201_CREATED
+                )
+            else:
+                return Response(
+                    serializer.errors,
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
         except Exception as e:
             logger.error(f"Error creating user image: {str(e)}")
             return Response(
                 {"error": str(e)},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )

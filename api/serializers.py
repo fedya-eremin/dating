@@ -78,10 +78,6 @@ class LikeSerializer(serializers.ModelSerializer):
         read_only_fields = ['created_at']
 
 class MatchSerializer(serializers.ModelSerializer):
-    user1 = UserSerializer(read_only=True)
-    user2 = UserSerializer(read_only=True)
-    first_message_sender = UserSerializer(read_only=True)
-
     class Meta:
         model = Match
         fields = [
@@ -90,8 +86,8 @@ class MatchSerializer(serializers.ModelSerializer):
         read_only_fields = ['created_at']
 
 class ReferralSerializer(serializers.ModelSerializer):
-    referrer = UserSerializer(read_only=True)
-    referred_user = UserSerializer(read_only=True)
+    referrer = serializers.PrimaryKeyRelatedField(queryset=User.objects.all())
+    referred_user = serializers.PrimaryKeyRelatedField(queryset=User.objects.all())
 
     class Meta:
         model = Referral

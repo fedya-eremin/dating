@@ -45,12 +45,6 @@ services:
       - DB_PASSWORD=postgres
       - DB_HOST=db
       - DB_PORT=5432
-      - RABBITMQ_HOST=rabbitmq
-      - RABBITMQ_PORT=5672
-      - RABBITMQ_USER=rabbit
-      - RABBITMQ_PASSWORD=rabbit
-      - CELERY_BROKER_URL=redis://redis:6379/1
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
     depends_on:
       db:
         condition: service_healthy
@@ -99,7 +93,7 @@ services:
 
   bot:
     build: .
-    command: python bot.py
+    command: python -m bot.bot
     volumes:
       - .:/code
     environment:
