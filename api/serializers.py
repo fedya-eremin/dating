@@ -1,8 +1,13 @@
+import logging
 from rest_framework import serializers
 from .models import User, UserImage, Like, Match, Referral
 from django.conf import settings
-import logging
 
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 class UserImageSerializer(serializers.ModelSerializer):
@@ -13,11 +18,17 @@ class UserImageSerializer(serializers.ModelSerializer):
         fields = ['id', 'image', 'image_url', 'created_at', 'is_main']
         
     def get_image_url(self, obj):
+        if isinstance(obj, dict):
+            return None
         if obj.image:
             return obj.image.url
         return None
 
     def validate_image(self, value):
+        logger.info(f"Validating image: {value}")
+        logger.info(f"Image content type: {value.content_type}")
+        logger.info(f"Image size: {value.size}")
+        
         if not value:
             raise serializers.ValidationError("Изображение обязательно")
         
@@ -31,8 +42,19 @@ class UserImageSerializer(serializers.ModelSerializer):
         
         return value
 
+    def validate(self, data):
+        logger.info(f"Validating data: {data}")
+        return data
+
     def create(self, validated_data):
+        logger.info(f"Creating image with data: {validated_data}")
         try:
+            # Проверяем наличие всех необходимых полей
+            if 'user' not in validated_data:
+                raise serializers.ValidationError("User is required")
+            if 'image' not in validated_data:
+                raise serializers.ValidationError("Image is required")
+            
             instance = super().create(validated_data)
             
             # Если это первое изображение пользователя, делаем его главным

@@ -1,9 +1,10 @@
 from aiogram import types, F
+from aiogram.client import bot
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import aiohttp
 import logging
-from bot.config import dp, API_URL
+from bot.config import dp, API_URL, bot
 from bot.storage.redis import queue_manager
 from bot.storage.minio import download_image_from_minio
 import requests
@@ -37,14 +38,11 @@ async def next_profile(message: types.Message):
             return
             
         # Загружаем фото из MinIO
-        image_url = profile['images'][0]['image']
+        image_url = profile['images'][0]['image'].replace("https://http://minio:9000/media/", "")
         # Извлекаем путь к файлу из URL
-        parsed_url = urlparse(image_url)
-        # Убираем хост и ведущий слеш из пути
-        image_path = parsed_url.path.lstrip('/').replace('minio:9000/media/', '')
         
-        logger.info(f"Trying to download image from path: {image_path}")
-        photo_data = await download_image_from_minio(image_path)
+        logger.info(f"Trying to download image from path: {image_url}")
+        photo_data = await download_image_from_minio(image_url)
         
         if not photo_data:
             await message.answer("😔 Не удалось загрузить фотографию пользователя.")
@@ -91,13 +89,14 @@ async def show_matches(message: types.Message):
         for match in matches:
             # Загружаем фото из MinIO
             photo_data = await download_image_from_minio(match['images'][0]['image'])
+            match_username = bot.get_chat(match['telegram_id'])
             
             await message.answer_photo(
                 photo_data,
                 caption=f"👤 {match['name']}, {match['age']}\n"
                        f"🏙 {match['city']}\n\n"
                        f"📝 {match['bio']}\n\n"
-                       f"💬 Напишите @{match['username']} в Telegram"
+                       f"💬 Напишите @{match_username} в Telegram"
             )
             
     except Exception as e:
@@ -138,11 +137,19 @@ async def process_profile_action(callback_query: types.CallbackQuery):
                 response = requests.get(f"{API_URL}/api/users/{profile_id}/")
                 response.raise_for_status()
                 match = response.json()
+
+                match_username = (await bot.get_chat(callback_query.from_user.id)).username
+                match_to_username = (await bot.get_chat(profile_id)).username
                 
                 # Отправляем сообщение о мэтче
+                await bot.send_message(
+                    profile_id,
+                    f"🎉 У вас мэтч с {callback_query.from_user.first_name}!\n"
+                    f"💬 Напишите @{match_username} в Telegram"
+                )
                 await callback_query.message.answer(
                     f"🎉 У вас мэтч с {match['name']}!\n"
-                    f"💬 Напишите @{match['username']} в Telegram"
+                    f"💬 Напишите @{match_to_username} в Telegram"
                 )
             else:
                 await callback_query.message.answer("✅ Лайк отправлен!")

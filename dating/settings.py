@@ -52,12 +52,14 @@ INSTALLED_APPS = [
 AUTH_USER_MODEL = 'api.User'
 
 MIDDLEWARE = [
+    'django_prometheus.middleware.PrometheusBeforeMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
+    'django_prometheus.middleware.PrometheusAfterMiddleware',
 ]
 
 # Security headers
@@ -87,16 +89,32 @@ MINIO_SECURE = os.getenv('MINIO_SECURE', 'False').lower() == 'true'
 # Media files settings
 MEDIA_URL = f'http://{MINIO_ENDPOINT}/{MINIO_BUCKET}/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+AWS_ACCESS_KEY_ID = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+AWS_SECRET_ACCESS_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
+AWS_STORAGE_BUCKET_NAME = os.getenv('MINIO_BUCKET_NAME', 'media')
+AWS_S3_ENDPOINT_URL = os.getenv('MINIO_ENDPOINT_URL', 'http://minio:9000')
+AWS_S3_USE_SSL = False
+AWS_QUERYSTRING_AUTH = False
+AWS_DEFAULT_ACL = 'public-read'
+AWS_S3_SIGNATURE_VERSION = 's3v4'
+AWS_S3_ADDRESSING_STYLE = 'path'
+AWS_S3_FILE_OVERWRITE = False
+AWS_S3_REGION_NAME = 'us-east-1'
+AWS_S3_CUSTOM_DOMAIN = f'{AWS_S3_ENDPOINT_URL}/{AWS_STORAGE_BUCKET_NAME}'
 
 STORAGES = {
     "default": {
-        "BACKEND": "api.models.MinIOStorage",
+        "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
+        "OPTIONS": {
+            "location": "media",
+            "file_overwrite": False,
+            "custom_domain": AWS_S3_CUSTOM_DOMAIN,
+        },
     },
     "staticfiles": {
         "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
     },
 }
-
 # MinIO connection check
 
 ROOT_URLCONF = 'dating.urls'

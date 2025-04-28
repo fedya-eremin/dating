@@ -1,3 +1,4 @@
+import logging
 from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
@@ -14,15 +15,20 @@ from .serializers import (
 from django.db.models import Q
 from rest_framework import serializers
 from rest_framework.generics import CreateAPIView
-import logging
 from rest_framework.views import APIView
 import redis
 import json
 import os
 
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv('REDIS_URL', 'redis://redis:6379/0')
+
 
 class UserImageViewSet(viewsets.ModelViewSet):
     queryset = UserImage.objects.all()
@@ -43,34 +49,38 @@ class UserImageViewSet(viewsets.ModelViewSet):
         
         try:
             user = User.objects.get(telegram_id=telegram_id)
-        except Exception:
+        except User.DoesNotExist:
             raise serializers.ValidationError({"telegram_id": "Пользователь не найден"})
+        
+        # Проверяем наличие файла
+        image = self.request.FILES.get('image')
+        if not image:
+            raise serializers.ValidationError({"image": "Файл изображения обязателен"})
+        
+        # Проверяем тип файла
+        if not image.content_type.startswith('image/'):
+            raise serializers.ValidationError({"image": "Файл должен быть изображением"})
+        
         try:
+            # Сохраняем изображение
             instance = serializer.save(user=user)
+            
+            # Проверяем, что файл действительно сохранился
+            if not instance.image:
+                raise serializers.ValidationError({"image": "Ошибка сохранения изображения"})
+            
+            # Проверяем доступность файла
+            if not instance.image.storage.exists(instance.image.name):
+                raise serializers.ValidationError({"image": "Ошибка сохранения в хранилище"})
+            
+            # Пересчитываем рейтинг пользователя
             user.calculate_primary_rating()
             
             logger.info(f"Successfully uploaded image for user {telegram_id}: {instance.image.url}")
             
         except Exception as e:
             logger.error(f"Error saving image for user {telegram_id}: {str(e)}")
-            raise serializers.ValidationError({"image": f"Ошибка сохранения изображения: {str(e)}"})
-
-    def create(self, request, *args, **kwargs):
-        try:
-            response = super().create(request, *args, **kwargs)
-            # Добавляем URL изображения в ответ
-            if response.status_code == status.HTTP_201_CREATED:
-                response.data['image_url'] = response.data.get('image')
-            return response
-        except serializers.ValidationError as e:
-            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            logger.error(f"Error uploading image: {str(e)}")
-            return Response(
-                {'error': 'Failed to upload image', 'detail': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
+        
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
     serializer_class = UserSerializer
@@ -301,57 +311,89 @@ class UserImageView(APIView):
     
     def post(self, request):
         try:
-            telegram_id = request.data.get('telegram_id')
+            logger.info(f"Received request data: {request.data}")
+            logger.info(f"Received request FILES: {request.FILES}")
+            
+            # Получаем telegram_id из разных источников
+            telegram_id = None
+            
+            # Сначала пробуем получить из FILES
+            telegram_id_file = request.FILES.get('telegram_id')
+            if telegram_id_file:
+                telegram_id = telegram_id_file.read().decode('utf-8').strip()
+            
+            # Если не нашли в FILES, пробуем получить из data
+            if not telegram_id:
+                telegram_id = request.data.get('telegram_id')
+            
+            logger.info(f"Extracted telegram_id: {telegram_id}")
+            
             if not telegram_id:
                 return Response(
                     {"error": "telegram_id is required"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
+            # Проверяем наличие пользователя
             try:
                 user = User.objects.get(telegram_id=telegram_id)
+                logger.info(f"Found user: {user.id}")
             except User.DoesNotExist:
                 return Response(
                     {"error": "User not found"},
                     status=status.HTTP_404_NOT_FOUND
                 )
             
+            # Проверяем наличие файла
             if 'image' not in request.FILES:
                 return Response(
                     {"error": "No image file provided"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-            # Создаем изображение
-            serializer = UserImageSerializer(data={
-                'user': user.id,
-                'image': request.FILES['image']
-            })
+            image_file = request.FILES['image']
+            logger.info(f"Image file: {image_file}")
+            logger.info(f"Image content type: {image_file.content_type}")
+            logger.info(f"Image size: {image_file.size}")
             
-            if serializer.is_valid():
-                image = serializer.save()
-                
-                # Если это первое изображение пользователя, делаем его главным
-                if not UserImage.objects.filter(user=user, is_main=True).exists():
-                    image.is_main = True
-                    image.save()
-                
-                # Обновляем рейтинг пользователя
-                user.calculate_primary_rating()
-                
+            # Проверяем тип файла
+            if not image_file.content_type.startswith('image/'):
                 return Response(
-                    UserImageSerializer(image).data,
-                    status=status.HTTP_201_CREATED
-                )
-            else:
-                return Response(
-                    serializer.errors,
+                    {"error": "File must be an image"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
+            
+            # Проверяем размер файла (10MB)
+            if image_file.size > 10 * 1024 * 1024:
+                return Response(
+                    {"error": "Image size must be less than 10MB"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Создаем изображение
+            image = UserImage.objects.create(
+                user=user,
+                image=image_file
+            )
+            
+            # Если это первое изображение пользователя, делаем его главным
+            if not UserImage.objects.filter(user=user, is_main=True).exists():
+                image.is_main = True
+                image.save()
+            
+            # Обновляем рейтинг пользователя
+            user.calculate_primary_rating()
+            
+            # Сериализуем результат
+            serializer = UserImageSerializer(image)
+            return Response(
+                serializer.data,
+                status=status.HTTP_201_CREATED
+            )
                 
         except Exception as e:
             logger.error(f"Error creating user image: {str(e)}")
             return Response(
-                {"error": str(e)},
+                {"error": "Internal server error"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
